@@ -75,3 +75,33 @@ total:            <N>
 ```
 
 Read the score via: `grep "^mcrmse:" run.log`
+
+## Logging results
+
+Log each experiment to `results.tsv` (tab-separated):
+
+```
+commit    mcrmse    status    description
+a1b2c3d    0.663    keep    baseline
+b2c3d4e    0.612    keep    added snr weighting
+```
+
+Do not commit `results.tsv`.
+
+## The experiment loop
+
+LOOP FOREVER:
+
+1. **THINK** — decide what to try next. Review `results.tsv`. Consider: SNR weighting, BPPS features, more layers, attention, ensembling.
+2. Modify `train.py` (and any helper files) with your experimental idea.
+3. `git commit`
+4. Run the experiment: `bash eval/eval.sh 2>&1 | tee run.log`
+5. Read the results: `grep "^mcrmse:" run.log`
+6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` for the stack trace and attempt a fix.
+7. **Review artifacts**: check `predictions.csv` for per-target RMSE breakdown.
+8. Record the results in `results.tsv` (do not commit it).
+9. If `mcrmse` improved, keep the git commit. If equal or worse, `git reset --hard HEAD~1`.
+
+**Timeout**: If a run exceeds 30 minutes, kill it and treat it as a failure.
+
+**NEVER STOP**: Once the loop begins, do NOT pause to ask the human. You are autonomous. The loop runs until interrupted.
