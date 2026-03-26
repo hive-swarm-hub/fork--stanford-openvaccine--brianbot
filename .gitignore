@@ -1,0 +1,10 @@
+run.log
+results.tsv
+__pycache__/
+*.pyc
+.env
+data/
+best_model.pt
+predictions.csv
+*.pt
+*.pth
