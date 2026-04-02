@@ -1,11 +1,10 @@
 """
-OpenVaccine mRNA Degradation Predictor — exp3
+OpenVaccine mRNA Degradation Predictor — exp4
 
-Building on exp1 (SNR weighting + wider GRU + cosine LR):
-- Per-position error weighting (weight loss by 1/(1+error) per position)
-- Structural features from dot-bracket: is_paired, partner_dist, stem_len
-- Both sample SNR and per-position error in the loss
-- Keep set_num_threads(2), hidden=256 3L biGRU, BPPS aggregates (zeros), cosine LR, 75 epochs
+Building on exp3 (struct features + error weighting + SNR weighting):
+- Add structural partner attention: for each position, also sees its base-pair partner's GRU state
+- Partner context is gated (zero for unpaired positions)
+- Keep hidden=256 3L biGRU, cosine LR, 75 epochs
 """
 
 import json
@@ -60,9 +59,9 @@ def load_json(path):
 
 
 def parse_structure(structure):
-    """Extract base-pair partners from dot-bracket notation."""
+    """Extract base-pair partners from dot-bracket notation. Returns list of partner indices (-1 = unpaired)."""
     n = len(structure)
-    partner = [-1] * n  # -1 = unpaired
+    partner = [-1] * n
     stack = []
     for i, c in enumerate(structure):
         if c == "(":
@@ -76,12 +75,7 @@ def parse_structure(structure):
 
 
 def structural_features(structure):
-    """
-    Per-position structural features:
-    - is_paired: 1 if in a stem, 0 otherwise
-    - partner_norm: normalized partner distance (0 if unpaired, else dist/L)
-    - stem_local: fraction of local 3-window that is paired
-    """
+    """Per-position structural features: is_paired, partner_norm_dist, local_stem_frac."""
     n = len(structure)
     partner = parse_structure(structure)
     is_paired = np.array([1.0 if partner[i] >= 0 else 0.0 for i in range(n)], dtype=np.float32)
@@ -89,12 +83,11 @@ def structural_features(structure):
         abs(partner[i] - i) / n if partner[i] >= 0 else 0.0
         for i in range(n)
     ], dtype=np.float32)
-    # local paired fraction (window 3)
     stem_local = np.zeros(n, dtype=np.float32)
     for i in range(n):
         lo, hi = max(0, i-1), min(n, i+2)
         stem_local[i] = is_paired[lo:hi].mean()
-    return np.stack([is_paired, partner_norm, stem_local], axis=1)  # (N, 3)
+    return np.stack([is_paired, partner_norm, stem_local], axis=1), partner  # (N,3), list
 
 
 class RNADataset(Dataset):
@@ -110,11 +103,16 @@ class RNADataset(Dataset):
         struct_t = torch.tensor([STRUCT_VOCAB.get(c, 0) for c in row["structure"]],           dtype=torch.long)
         loop_t   = torch.tensor([LOOP_VOCAB.get(c, 0)   for c in row["predicted_loop_type"]], dtype=torch.long)
 
-        # Structural features from dot-bracket
-        struct_feat = torch.tensor(structural_features(row["structure"]), dtype=torch.float32)  # (N, 3)
+        sfeat, partner = structural_features(row["structure"])
+        struct_feat = torch.tensor(sfeat, dtype=torch.float32)  # (N, 3)
+
+        # Partner indices: if unpaired, self-attend (index = i)
+        n = len(row["sequence"])
+        partner_idx = torch.tensor([p if p >= 0 else i for i, p in enumerate(partner)], dtype=torch.long)
+        partner_mask = torch.tensor([1.0 if p >= 0 else 0.0 for p in partner], dtype=torch.float32)
 
         labels = np.zeros((SEQ_SCORED, len(TARGETS)), dtype=np.float32)
-        errors = np.ones((SEQ_SCORED, len(TARGETS)), dtype=np.float32)  # default: no weighting
+        errors = np.ones((SEQ_SCORED, len(TARGETS)), dtype=np.float32)
         for i, (t, ek) in enumerate(zip(TARGETS, ERROR_KEYS)):
             if t in row and row[t]:
                 vals = row[t][:SEQ_SCORED]
@@ -124,24 +122,29 @@ class RNADataset(Dataset):
                 errors[:len(errs), i] = errs
 
         snr = float(row.get("signal_to_noise", 1.0))
-        return seq_t, struct_t, loop_t, struct_feat, torch.tensor(labels), torch.tensor(errors), snr, row["id"]
+        return (seq_t, struct_t, loop_t, struct_feat, partner_idx, partner_mask,
+                torch.tensor(labels), torch.tensor(errors), snr, row["id"])
 
 
 def collate_fn(batch):
-    seqs, structs, loops, sfeat_list, labels, errors, snrs, ids = zip(*batch)
+    seqs, structs, loops, sfeat_list, pidx_list, pmask_list, labels, errors, snrs, ids = zip(*batch)
     max_len = max(s.shape[0] for s in seqs)
     B = len(seqs)
     seq_p    = torch.zeros(B, max_len, dtype=torch.long)
     struct_p = torch.zeros(B, max_len, dtype=torch.long)
     loop_p   = torch.zeros(B, max_len, dtype=torch.long)
     sfeat_p  = torch.zeros(B, max_len, 3, dtype=torch.float32)
-    for i, (s, st, l, sf) in enumerate(zip(seqs, structs, loops, sfeat_list)):
+    pidx_p   = torch.zeros(B, max_len, dtype=torch.long)   # default 0 (will be masked)
+    pmask_p  = torch.zeros(B, max_len, dtype=torch.float32)
+    for i, (s, st, l, sf, pi, pm) in enumerate(zip(seqs, structs, loops, sfeat_list, pidx_list, pmask_list)):
         n = len(s)
         seq_p[i, :n]    = s
         struct_p[i, :n] = st
         loop_p[i, :n]   = l
         sfeat_p[i, :n, :] = sf
-    return (seq_p, struct_p, loop_p, sfeat_p,
+        pidx_p[i, :n]   = pi
+        pmask_p[i, :n]  = pm
+    return (seq_p, struct_p, loop_p, sfeat_p, pidx_p, pmask_p,
             torch.stack(labels), torch.stack(errors),
             torch.tensor(snrs, dtype=torch.float32), list(ids))
 
@@ -160,31 +163,39 @@ class GRUModel(nn.Module):
             bidirectional=True,
             dropout=DROPOUT if NUM_LAYERS > 1 else 0.0,
         )
+        D = HIDDEN_SIZE * 2
+        # Partner attention: concatenate own state + partner state, project
+        self.partner_proj = nn.Sequential(
+            nn.Linear(D * 2, D),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT),
+        )
         self.drop = nn.Dropout(DROPOUT)
-        self.head = nn.Linear(HIDDEN_SIZE * 2, len(TARGETS))
+        self.head = nn.Linear(D, len(TARGETS))
 
-    def forward(self, seq, struct, loop, sfeat):
+    def forward(self, seq, struct, loop, sfeat, partner_idx, partner_mask):
         x = torch.cat([self.seq_emb(seq), self.struct_emb(struct), self.loop_emb(loop), sfeat], dim=-1)
-        out, _ = self.gru(x)
-        return self.head(self.drop(out))  # (B, L, n_targets)
+        out, _ = self.gru(x)  # (B, L, D)
+
+        # Gather partner hidden states
+        B, L, D = out.shape
+        batch_idx = torch.arange(B, device=out.device).unsqueeze(1).expand(B, L)  # (B, L)
+        h_partner = out[batch_idx, partner_idx]  # (B, L, D)
+        # Zero out unpaired positions
+        h_partner = h_partner * partner_mask.unsqueeze(-1)
+
+        # Combine own state + partner state
+        combined = torch.cat([out, h_partner], dim=-1)  # (B, L, 2D)
+        h = self.partner_proj(combined)  # (B, L, D)
+
+        return self.head(self.drop(h))  # (B, L, n_targets)
 
 
 def error_snr_weighted_loss(preds, labels, errors, snr_weights):
-    """
-    Combined per-position error weighting and per-sample SNR weighting.
-    Per-position: w = 1/(1 + error_normalized)
-    Per-sample: w = snr / sum(snr)
-    """
-    # Error-based per-position weights (B, L, T)
-    # Normalize errors by global median to avoid scale issues
     err_median = errors.median().clamp(min=1e-6)
     err_norm = errors / err_median
-    pos_weights = 1.0 / (1.0 + err_norm)  # (B, L, T)
-
-    # Weighted MSE per sample
-    mse = ((preds - labels) ** 2 * pos_weights).sum(dim=(1, 2)) / pos_weights.sum(dim=(1, 2)).clamp(min=1e-6)  # (B,)
-
-    # SNR sample weighting
+    pos_weights = 1.0 / (1.0 + err_norm)
+    mse = ((preds - labels) ** 2 * pos_weights).sum(dim=(1, 2)) / pos_weights.sum(dim=(1, 2)).clamp(min=1e-6)
     w = snr_weights / snr_weights.sum()
     return (mse * w).sum() * len(snr_weights)
 
@@ -218,17 +229,21 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
 
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model params: {total_params:,}")
+
     best_score = float("inf")
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
         train_loss = 0.0
-        for seq, struct, loop, sfeat, labels, errors, snrs, _ in train_loader:
-            seq, struct, loop, sfeat, labels, errors, snrs = (
+        for seq, struct, loop, sfeat, pidx, pmask, labels, errors, snrs, _ in train_loader:
+            seq, struct, loop, sfeat, pidx, pmask = (
                 seq.to(DEVICE), struct.to(DEVICE), loop.to(DEVICE),
-                sfeat.to(DEVICE), labels.to(DEVICE), errors.to(DEVICE), snrs.to(DEVICE)
+                sfeat.to(DEVICE), pidx.to(DEVICE), pmask.to(DEVICE)
             )
-            preds = model(seq, struct, loop, sfeat)[:, :SEQ_SCORED, :]
+            labels, errors, snrs = labels.to(DEVICE), errors.to(DEVICE), snrs.to(DEVICE)
+            preds = model(seq, struct, loop, sfeat, pidx, pmask)[:, :SEQ_SCORED, :]
             loss  = error_snr_weighted_loss(preds, labels, errors, snrs)
             optimizer.zero_grad()
             loss.backward()
@@ -240,9 +255,12 @@ def main():
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for seq, struct, loop, sfeat, labels, _, _, _ in val_loader:
-                seq, struct, loop, sfeat = seq.to(DEVICE), struct.to(DEVICE), loop.to(DEVICE), sfeat.to(DEVICE)
-                all_preds.append(model(seq, struct, loop, sfeat)[:, :SEQ_SCORED, :].cpu())
+            for seq, struct, loop, sfeat, pidx, pmask, labels, _, _, _ in val_loader:
+                seq, struct, loop, sfeat, pidx, pmask = (
+                    seq.to(DEVICE), struct.to(DEVICE), loop.to(DEVICE),
+                    sfeat.to(DEVICE), pidx.to(DEVICE), pmask.to(DEVICE)
+                )
+                all_preds.append(model(seq, struct, loop, sfeat, pidx, pmask)[:, :SEQ_SCORED, :].cpu())
                 all_labels.append(labels)
 
         val_score = mcrmse(torch.cat(all_preds), torch.cat(all_labels))
@@ -257,9 +275,12 @@ def main():
     model.eval()
     rows = []
     with torch.no_grad():
-        for seq, struct, loop, sfeat, _, _, _, ids in val_loader:
-            seq, struct, loop, sfeat = seq.to(DEVICE), struct.to(DEVICE), loop.to(DEVICE), sfeat.to(DEVICE)
-            preds = model(seq, struct, loop, sfeat)[:, :SEQ_SCORED, :].cpu().numpy()
+        for seq, struct, loop, sfeat, pidx, pmask, _, _, _, ids in val_loader:
+            seq, struct, loop, sfeat, pidx, pmask = (
+                seq.to(DEVICE), struct.to(DEVICE), loop.to(DEVICE),
+                sfeat.to(DEVICE), pidx.to(DEVICE), pmask.to(DEVICE)
+            )
+            preds = model(seq, struct, loop, sfeat, pidx, pmask)[:, :SEQ_SCORED, :].cpu().numpy()
             for b, sid in enumerate(ids):
                 for pos in range(SEQ_SCORED):
                     row = {"id_seqpos": f"{sid}_{pos}"}
