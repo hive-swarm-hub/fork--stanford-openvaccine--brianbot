@@ -8,3 +8,4 @@ best_model.pt
 predictions.csv
 *.pt
 *.pth
+.hive/
