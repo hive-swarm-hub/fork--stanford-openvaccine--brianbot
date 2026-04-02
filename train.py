@@ -1,11 +1,13 @@
 """
-OpenVaccine mRNA Degradation Predictor — Simple GRU Baseline
+OpenVaccine mRNA Degradation Predictor
 
-Agents: modify this file to improve the MCRMSE score.
-Do NOT modify eval/ or prepare.sh.
-
-This baseline uses a bidirectional GRU with sequence, structure, and loop type embeddings.
-Predictions are saved to predictions.csv for scoring by eval/score.py.
+Improvements over baseline:
+- torch.set_num_threads(2) to match 2-CPU container (huge speedup)
+- SNR-weighted loss (weight samples by signal_to_noise)
+- BPPS features: sum, max, and nb-paired per position
+- Wider biGRU (hidden=256, 3 layers)
+- Cosine LR annealing
+- More epochs (75)
 """
 
 import json
@@ -15,15 +17,20 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import random
+import math
+
+# Fix thread count to match container CPU quota (2 CPUs)
+torch.set_num_threads(2)
+torch.set_num_interop_threads(1)
 
 # ======================= CONFIG =======================
 SEED = 42          # keep in sync with eval/score.py
 VAL_SPLIT = 0.2    # keep in sync with eval/score.py
 BATCH_SIZE = 64
-EPOCHS = 30
+EPOCHS = 75
 LR = 1e-3
-HIDDEN_SIZE = 128
-NUM_LAYERS = 2
+HIDDEN_SIZE = 256
+NUM_LAYERS = 3
 DROPOUT = 0.3
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -53,6 +60,15 @@ def load_json(path):
     return [json.loads(line) for line in content.splitlines() if line.strip()]
 
 
+def bpps_features(bpps_matrix, seq_len):
+    """Compute per-position BPPS aggregate features from the NxN matrix."""
+    mat = np.array(bpps_matrix, dtype=np.float32)  # (N, N)
+    bpps_sum = mat.sum(axis=1)                      # total pairing probability
+    bpps_max = mat.max(axis=1)                      # strongest pairing partner
+    bpps_nb  = (mat > 0.1).sum(axis=1).astype(np.float32)  # nb of partners
+    return np.stack([bpps_sum, bpps_max, bpps_nb], axis=1)  # (N, 3)
+
+
 class RNADataset(Dataset):
     def __init__(self, data):
         self.data = data
@@ -66,27 +82,38 @@ class RNADataset(Dataset):
         struct_t = torch.tensor([STRUCT_VOCAB.get(c, 0) for c in row["structure"]],           dtype=torch.long)
         loop_t   = torch.tensor([LOOP_VOCAB.get(c, 0)   for c in row["predicted_loop_type"]], dtype=torch.long)
 
+        # BPPS features
+        seq_len = len(row["sequence"])
+        if "bpps" in row and row["bpps"]:
+            bpps_feat = bpps_features(row["bpps"], seq_len)  # (N, 3)
+        else:
+            bpps_feat = np.zeros((seq_len, 3), dtype=np.float32)
+        bpps_t = torch.tensor(bpps_feat, dtype=torch.float32)
+
         labels = np.zeros((SEQ_SCORED, len(TARGETS)), dtype=np.float32)
         for i, t in enumerate(TARGETS):
             if t in row and row[t]:
                 vals = row[t][:SEQ_SCORED]
                 labels[:len(vals), i] = vals
 
-        return seq_t, struct_t, loop_t, torch.tensor(labels), row["id"]
+        snr = float(row.get("signal_to_noise", 1.0))
+        return seq_t, struct_t, loop_t, bpps_t, torch.tensor(labels), snr, row["id"]
 
 
 def collate_fn(batch):
-    seqs, structs, loops, labels, ids = zip(*batch)
+    seqs, structs, loops, bpps_list, labels, snrs, ids = zip(*batch)
     max_len = max(s.shape[0] for s in seqs)
     B = len(seqs)
     seq_p    = torch.zeros(B, max_len, dtype=torch.long)
     struct_p = torch.zeros(B, max_len, dtype=torch.long)
     loop_p   = torch.zeros(B, max_len, dtype=torch.long)
-    for i, (s, st, l) in enumerate(zip(seqs, structs, loops)):
+    bpps_p   = torch.zeros(B, max_len, 3, dtype=torch.float32)
+    for i, (s, st, l, bp) in enumerate(zip(seqs, structs, loops, bpps_list)):
         seq_p[i, :len(s)]    = s
         struct_p[i, :len(st)] = st
         loop_p[i, :len(l)]   = l
-    return seq_p, struct_p, loop_p, torch.stack(labels), list(ids)
+        bpps_p[i, :bp.shape[0], :] = bp
+    return seq_p, struct_p, loop_p, bpps_p, torch.stack(labels), torch.tensor(snrs, dtype=torch.float32), list(ids)
 
 
 class GRUModel(nn.Module):
@@ -95,8 +122,9 @@ class GRUModel(nn.Module):
         self.seq_emb    = nn.Embedding(len(SEQ_VOCAB) + 1,    32)
         self.struct_emb = nn.Embedding(len(STRUCT_VOCAB) + 1, 16)
         self.loop_emb   = nn.Embedding(len(LOOP_VOCAB) + 1,   16)
+        # Input: 32 + 16 + 16 + 3 (bpps) = 67
         self.gru = nn.GRU(
-            64, HIDDEN_SIZE,
+            67, HIDDEN_SIZE,
             num_layers=NUM_LAYERS,
             batch_first=True,
             bidirectional=True,
@@ -105,10 +133,18 @@ class GRUModel(nn.Module):
         self.drop = nn.Dropout(DROPOUT)
         self.head = nn.Linear(HIDDEN_SIZE * 2, len(TARGETS))
 
-    def forward(self, seq, struct, loop):
-        x = torch.cat([self.seq_emb(seq), self.struct_emb(struct), self.loop_emb(loop)], dim=-1)
+    def forward(self, seq, struct, loop, bpps):
+        x = torch.cat([self.seq_emb(seq), self.struct_emb(struct), self.loop_emb(loop), bpps], dim=-1)
         out, _ = self.gru(x)
         return self.head(self.drop(out))  # (B, L, n_targets)
+
+
+def snr_weighted_mse(preds, labels, snr_weights):
+    """MSE weighted by per-sample SNR."""
+    # preds, labels: (B, L, T); snr_weights: (B,)
+    mse = ((preds - labels) ** 2).mean(dim=(1, 2))  # (B,)
+    w = snr_weights / snr_weights.sum()
+    return (mse * w).sum() * len(snr_weights)
 
 
 def mcrmse(preds, labels):
@@ -119,6 +155,7 @@ def mcrmse(preds, labels):
 def main():
     set_seed(SEED)
     print(f"Device: {DEVICE}")
+    print(f"Threads: {torch.get_num_threads()}")
 
     all_data = load_json("data/train.json")
 
@@ -139,28 +176,33 @@ def main():
 
     model     = GRUModel().to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    criterion = nn.MSELoss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
 
     best_score = float("inf")
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
         train_loss = 0.0
-        for seq, struct, loop, labels, _ in train_loader:
-            seq, struct, loop, labels = seq.to(DEVICE), struct.to(DEVICE), loop.to(DEVICE), labels.to(DEVICE)
-            preds = model(seq, struct, loop)[:, :SEQ_SCORED, :]
-            loss  = criterion(preds, labels)
+        for seq, struct, loop, bpps, labels, snrs, _ in train_loader:
+            seq, struct, loop, bpps, labels, snrs = (
+                seq.to(DEVICE), struct.to(DEVICE), loop.to(DEVICE),
+                bpps.to(DEVICE), labels.to(DEVICE), snrs.to(DEVICE)
+            )
+            preds = model(seq, struct, loop, bpps)[:, :SEQ_SCORED, :]
+            loss  = snr_weighted_mse(preds, labels, snrs)
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             train_loss += loss.item()
+        scheduler.step()
 
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
-            for seq, struct, loop, labels, _ in val_loader:
-                seq, struct, loop = seq.to(DEVICE), struct.to(DEVICE), loop.to(DEVICE)
-                all_preds.append(model(seq, struct, loop)[:, :SEQ_SCORED, :].cpu())
+            for seq, struct, loop, bpps, labels, _, _ in val_loader:
+                seq, struct, loop, bpps = seq.to(DEVICE), struct.to(DEVICE), loop.to(DEVICE), bpps.to(DEVICE)
+                all_preds.append(model(seq, struct, loop, bpps)[:, :SEQ_SCORED, :].cpu())
                 all_labels.append(labels)
 
         val_score = mcrmse(torch.cat(all_preds), torch.cat(all_labels))
@@ -169,16 +211,16 @@ def main():
             torch.save(model.state_dict(), "best_model.pt")
 
         if epoch % 5 == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d}/{EPOCHS} | loss: {train_loss/len(train_loader):.4f} | val MCRMSE: {val_score:.4f} | best: {best_score:.4f}")
+            print(f"Epoch {epoch:3d}/{EPOCHS} | loss: {train_loss/len(train_loader):.4f} | val MCRMSE: {val_score:.4f} | best: {best_score:.4f} | lr: {scheduler.get_last_lr()[0]:.2e}")
 
     # Save predictions with best model
     model.load_state_dict(torch.load("best_model.pt", map_location=DEVICE))
     model.eval()
     rows = []
     with torch.no_grad():
-        for seq, struct, loop, _, ids in val_loader:
-            seq, struct, loop = seq.to(DEVICE), struct.to(DEVICE), loop.to(DEVICE)
-            preds = model(seq, struct, loop)[:, :SEQ_SCORED, :].cpu().numpy()
+        for seq, struct, loop, bpps, _, _, ids in val_loader:
+            seq, struct, loop, bpps = seq.to(DEVICE), struct.to(DEVICE), loop.to(DEVICE), bpps.to(DEVICE)
+            preds = model(seq, struct, loop, bpps)[:, :SEQ_SCORED, :].cpu().numpy()
             for b, sid in enumerate(ids):
                 for pos in range(SEQ_SCORED):
                     row = {"id_seqpos": f"{sid}_{pos}"}
